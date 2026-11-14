@@ -1,0 +1,18 @@
+# The build needs: Cargo.toml, Cargo.lock, build.rs, src/, web/ (sources only).
+# Tests and fixtures are not used by `cargo build --release`.
+.git
+.github
+.env
+target
+data
+web/node_modules
+web/dist
+tests
+fixtures
+scripts
+*.md
+!web/**/*.md
+Dockerfile
+.dockerignore
+docker-compose*.yml
+Caddyfile

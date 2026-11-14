@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+// Test helpers hand tungstenite's own error back to the test, which matches on
+// it; boxing it would only make those matches noisier.
+#![allow(clippy::result_large_err)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

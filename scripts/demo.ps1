@@ -1,4 +1,4 @@
-# Demo mode: the real server on http://127.0.0.1:8787 (temp data dir) and TWO fake desktops,
+# Demo mode: the real server on http://127.0.0.1:11020 (temp data dir) and TWO fake desktops,
 # "Office PC" and "Home PC", with sample panes (waiting with a 3-option menu, working, done, idle).
 # Open a pairing URL in a browser (or the phone emulator) to pair; answer, interrupt and prompt work.
 # Each fake desktop approves pairing with capability `prompt` and keeps a pairing window open
@@ -19,10 +19,10 @@
 # The fake desktops are an #[ignore]d test of the ymux repo (remote::runtime::e2e::demo_fake_desktop):
 # test code, not part of any build of the app.
 #
-#   pwsh scripts\demo.ps1 [-Ymux ..\ymux] [-Port 8787] [-SkipWebBuild] [-AutoApprove:$false]
+#   pwsh scripts\demo.ps1 [-Ymux ..\ymux] [-Port 11020] [-SkipWebBuild] [-AutoApprove:$false]
 param(
     [string]$Ymux = '..\ymux',
-    [int]$Port = 8787,
+    [int]$Port = 11020,
     [switch]$SkipWebBuild,
     [bool]$AutoApprove = $true
 )

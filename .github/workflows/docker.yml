@@ -1,0 +1,151 @@
+name: docker
+
+# Every push to main and every pull request BUILDS the image and runs it (nothing is pushed).
+# The image is PUBLISHED to ghcr.io only for version tags (v*) and by hand (workflow_dispatch).
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY_IMAGE: ghcr.io/youngmins/ymux-server
+
+permissions:
+  contents: read
+
+jobs:
+  # Build for the runner's own architecture, start it, and check it works.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ymux-server:ci
+          cache-from: type=gha,scope=smoke
+          cache-to: type=gha,scope=smoke,mode=max
+      - name: Run the image and check it
+        run: |
+          set -eu
+          docker run -d --name ymux --read-only --tmpfs /tmp \
+            -e YMUX_SERVER_PUBLIC_URL=http://localhost:11020 \
+            -p 127.0.0.1:11020:11020 ymux-server:ci
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:11020/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != 1 ]; then docker logs ymux; echo "healthz never answered"; exit 1; fi
+          curl -fsS http://127.0.0.1:11020/healthz
+          echo
+          curl -fsS http://127.0.0.1:11020/api/info | tee info.json
+          echo
+          grep -q '"v":1' info.json
+          token="$(docker exec ymux ymux-server token)"
+          test -n "$token"
+          echo "setup token printed (${#token} characters)"
+          uid="$(docker exec ymux id -u)"
+          echo "container uid: $uid"
+          test "$uid" != 0
+          test "$(docker inspect --format '{{.Config.User}}' ymux-server:ci)" = ymux
+          # The healthcheck baked into the image must also turn healthy.
+          for i in $(seq 1 40); do
+            s="$(docker inspect --format '{{.State.Health.Status}}' ymux)"
+            [ "$s" = healthy ] && break
+            sleep 2
+          done
+          echo "health: $s"
+          test "$s" = healthy
+      - name: Container logs
+        if: always()
+        run: docker logs ymux || true
+
+  # Publishing: one native build per architecture (no emulation), pushed by digest ...
+  build:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: smoke
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ... then one manifest list that points at both.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          # On a version tag: latest (automatic for semver tags), 1.2.3 and 1.2.
+          # On a manual run from a branch: the branch name and the short commit.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}

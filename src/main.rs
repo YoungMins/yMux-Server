@@ -16,7 +16,7 @@ USAGE:
 
 ENVIRONMENT:
     YMUX_SERVER_PUBLIC_URL   required, https://... (http://localhost allowed for development)
-    YMUX_SERVER_BIND         default 127.0.0.1:8787
+    YMUX_SERVER_BIND         default 127.0.0.1:11020
     YMUX_SERVER_DATA_DIR     default ./data
     YMUX_SERVER_TRUST_PROXY  1 to take the client address from the LAST X-Forwarded-For hop
                              (the proxy must overwrite or append to that header itself)

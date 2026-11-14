@@ -1,35 +1,36 @@
-# yMux server behind Caddy, which obtains and renews the TLS certificate.
+# yMux server, one container, for a host that already has a reverse proxy or a tunnel
+# (Nginx Proxy Manager, Synology/QNAP, Traefik, Cloudflare Tunnel, ...).
 #
-#   1. Point a DNS name at this machine and set it below (and in Caddyfile).
-#   2. docker compose up -d
-#   3. docker compose exec ymux-server ymux-server token   (shows the setup token; it is never
-#      written to the logs, which only say that one was created)
+#   cp .env.example .env        # set YMUX_SERVER_PUBLIC_URL
+#   docker compose up -d --build            (before an image is published; builds from this folder)
+#   docker compose pull && docker compose up -d   (once ghcr.io/youngmins/ymux-server exists)
+#   docker compose exec ymux-server ymux-server token   (shows the setup token)
+#
+# Then point the proxy at http://<this host>:11020 with WebSocket upgrade enabled.
+# Want automatic HTTPS without another proxy? Use docker-compose.caddy.yml.
 services:
   ymux-server:
+    image: ghcr.io/youngmins/ymux-server:latest
     build: .
     restart: unless-stopped
     environment:
-      YMUX_SERVER_PUBLIC_URL: https://remote.example.com
-      YMUX_SERVER_TRUST_PROXY: "1"
+      YMUX_SERVER_PUBLIC_URL: ${YMUX_SERVER_PUBLIC_URL:?Set YMUX_SERVER_PUBLIC_URL in .env, e.g. https://remote.example.com (copy .env.example to .env)}
+      YMUX_SERVER_TRUST_PROXY: ${YMUX_SERVER_TRUST_PROXY:-1}
+    ports:
+      - "${YMUX_SERVER_PUBLISH:-127.0.0.1}:${YMUX_SERVER_PORT:-11020}:11020"
     volumes:
       - ymux-data:/data
-    expose:
-      - "8787"
-
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    depends_on:
-      - ymux-server
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   ymux-data:
-  caddy-data:
-  caddy-config:

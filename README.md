@@ -19,29 +19,100 @@ All settings are environment variables.
 | Variable | Default | Meaning |
 |---|---|---|
 | `YMUX_SERVER_PUBLIC_URL` | required | The `https://` address users reach the server at, e.g. `https://remote.example.com`. Must have no path. `http://localhost[:port]` and `http://127.0.0.1[:port]` are accepted for development; the server refuses to start with anything else. Device WebSockets must come from exactly this origin. |
-| `YMUX_SERVER_BIND` | `127.0.0.1:8787` | Listen address. Keep it on loopback when a proxy runs on the same host. |
+| `YMUX_SERVER_BIND` | `127.0.0.1:11020` | Listen address. Keep it on loopback when a proxy runs on the same host. |
 | `YMUX_SERVER_DATA_DIR` | `./data` | Where `state.json` (VAPID keys, paired desktops and devices) and `setup-token` live. Written atomically, mode 0600 on Unix. |
 | `YMUX_SERVER_TRUST_PROXY` | off | Set `1` to take the client address for rate limiting from the **last** hop of `X-Forwarded-For` (and only that hop). See [Behind a proxy](#behind-a-proxy-ymux_server_trust_proxy). Without it the TCP peer address is used and the header is ignored. |
 | `RUST_LOG` | `ymux_server=info` | Log filter. Logs carry ids and codes only. |
 
 ## Quick start
 
-### Docker
+### Deploy with Docker
+
+You need a server with Docker and Compose, and a domain name pointing at it (or a tunnel).
+TLS comes from a reverse proxy, a tunnel, or the bundled Caddy.
+
+1. Get the code: `git clone https://github.com/YoungMins/yMux-Server && cd yMux-Server`
+2. Copy the settings file and edit it: `cp .env.example .env`. Set `YMUX_SERVER_PUBLIC_URL` to
+   the address you will use, e.g. `https://remote.example.com` (or `YMUX_DOMAIN` for shape B).
+3. Start it, in one of two shapes:
+
+   **A. You already have a reverse proxy or tunnel** (Nginx Proxy Manager, Synology or QNAP,
+   Traefik, Cloudflare Tunnel). One container, port 11020, plain HTTP:
+
+   ```sh
+   docker compose up -d --build
+   ```
+
+   **B. You have nothing in front** and want automatic HTTPS. The server plus Caddy; ports 80 and
+   443 must reach this machine:
+
+   ```sh
+   docker compose -f docker-compose.caddy.yml up -d --build
+   ```
+
+   The published image `ghcr.io/youngmins/ymux-server` exists only after the owner pushes a
+   version tag. Until then `--build` builds it from this folder (a few minutes the first time).
+
+4. Read the setup token (the logs never show it). For shape B add `-f docker-compose.caddy.yml`:
+
+   ```sh
+   docker compose exec ymux-server ymux-server token
+   ```
+
+5. Shape A only: point your proxy at `http://<this host>:11020` with **WebSocket support on**
+   (see below). The port is published on `127.0.0.1` only; if the proxy runs on another machine
+   set `YMUX_SERVER_PUBLISH=0.0.0.0` in `.env` and firewall the port to that machine, because it
+   speaks plain HTTP and trusts `X-Forwarded-For`.
+6. In yMux: **Settings -> Remote server**, enter the address and the setup token, connect, then
+   **Pair a phone** (see [Connecting yMux](#connecting-ymux)).
+
+Proxy notes for shape A:
+
+- **Nginx Proxy Manager:** add a Proxy Host for your domain, forward to this host and port 11020,
+  switch on *Websockets Support*, and request a certificate on the SSL tab.
+- **Synology:** Control Panel -> Login Portal -> Advanced -> Reverse Proxy: source HTTPS on your
+  domain, destination HTTP `localhost` 11020. Edit the rule, Custom Header tab, *Create ->
+  WebSocket* (adds the two Upgrade headers).
+- **Cloudflare Tunnel:** a public hostname for your domain with service `http://localhost:11020`
+  (or `http://ymux-server:11020` when `cloudflared` runs in the same compose network). WebSockets
+  work without extra settings.
+- **Caddy / nginx:** the snippets in [Reverse proxy](#reverse-proxy).
+
+Update: `git pull && docker compose up -d --build`. Once images are published, use
+`docker compose pull && docker compose up -d` instead. (Shape B: add `-f docker-compose.caddy.yml`
+to every command.)
+
+Back up the `ymux-data` volume (`/data` in the container). It holds `state.json` (the server's
+push keys and the registered desktops and paired phones) and `setup-token`. Lose it and every
+desktop must register again and every phone must be paired again. A simple copy:
+
+```sh
+docker run --rm -v ymux-server_ymux-data:/data -v "$PWD":/backup alpine tar czf /backup/ymux-data.tgz -C /data .
+```
+
+(The volume name starts with the folder name, `docker volume ls` shows it.)
+
+Troubleshooting, the three usual mistakes:
+
+- **`origin_mismatch` or the phone cannot connect:** `YMUX_SERVER_PUBLIC_URL` must be exactly the
+  address people type (same scheme, host and port, no path, no trailing slash). Fix `.env`, then
+  `docker compose up -d`.
+- **Connects, then drops at once or never goes online:** the proxy does not pass WebSocket
+  upgrades on `/ws/*`. Turn the WebSocket option on (above).
+- **yMux or the phone says the address is unsafe or refuses it:** you typed `http://...`. Use the
+  `https://` address of the proxy. Plain `http` works only for `localhost`.
+
+### Plain `docker run`
 
 ```sh
 docker build -t ymux-server .
 docker run -d --name ymux-server --restart unless-stopped \
   -e YMUX_SERVER_PUBLIC_URL=https://remote.example.com \
   -e YMUX_SERVER_TRUST_PROXY=1 \
-  -v ymux-data:/data -p 127.0.0.1:8787:8787 ymux-server
-docker logs ymux-server                              # says a setup token was created; does not show it
+  -v ymux-data:/data -p 127.0.0.1:11020:11020 ymux-server
 docker exec ymux-server ymux-server token            # show the setup token
 docker exec ymux-server ymux-server token --rotate   # replace it
 ```
-
-`docker-compose.yml` runs the server together with Caddy (automatic HTTPS): edit the host name
-in it and in `Caddyfile`, then `docker compose up -d`. Read the token with
-`docker compose exec ymux-server ymux-server token`.
 
 ### Binary
 
@@ -91,7 +162,7 @@ The server speaks plain HTTP and WebSocket; the proxy must pass WebSocket upgrad
 
 ```
 remote.example.com {
-	reverse_proxy 127.0.0.1:8787
+	reverse_proxy 127.0.0.1:11020
 }
 ```
 
@@ -108,7 +179,7 @@ server {
     # ssl_certificate / ssl_certificate_key ...
 
     location / {
-        proxy_pass http://127.0.0.1:8787;
+        proxy_pass http://127.0.0.1:11020;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -256,18 +327,18 @@ TLS, a real browser, real Web Push, and the Tauri page itself.
 
 ## Demo mode
 
-`scripts/demo.ps1` starts the server on `http://127.0.0.1:8787` (temp data dir; builds `web/` first
+`scripts/demo.ps1` starts the server on `http://127.0.0.1:11020` (temp data dir; builds `web/` first
 unless `-SkipWebBuild`) and two fake desktops, "Office PC" and "Home PC", that stay up until Ctrl+C.
 Each has a few panes in two workspaces (one waiting with a three-option menu, one working, one done,
 one idle) with about 40 lines of sample terminal text; answering turns the waiting pane into a
 working one, and a queued prompt to a working pane raises its `queued` count. Each approves pairing
 with capability `prompt` and renews its pairing window every 100 s and after each pairing. The script
-prints both `http://127.0.0.1:8787/#pair=...` links and keeps the current ones in `demo-urls.txt` in
+prints both `http://127.0.0.1:11020/#pair=...` links and keeps the current ones in `demo-urls.txt` in
 the temp directory it names. The fake desktops are an `#[ignore]`d test of the ymux repo
 (`remote::runtime::e2e::demo_fake_desktop`): test code that no build of the app contains.
 
 ```powershell
-pwsh scripts\demo.ps1 [-Ymux ..\ymux] [-Port 8787] [-SkipWebBuild]
+pwsh scripts\demo.ps1 [-Ymux ..\ymux] [-Port 11020] [-SkipWebBuild]
 ```
 
 ## License

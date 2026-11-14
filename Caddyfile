@@ -1,4 +1,5 @@
-remote.example.com {
-	# Caddy proxies WebSocket upgrades automatically.
-	reverse_proxy ymux-server:8787
+# Used by docker-compose.caddy.yml. The domain comes from YMUX_DOMAIN in .env.
+{$YMUX_DOMAIN} {
+	# Caddy proxies WebSocket upgrades automatically and sets X-Forwarded-For.
+	reverse_proxy ymux-server:11020
 }

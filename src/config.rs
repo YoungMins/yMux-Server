@@ -82,7 +82,7 @@ pub fn parse_public_url(raw: &str) -> Result<(String, bool), String> {
 
 impl Config {
     pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let bind = get("YMUX_SERVER_BIND").unwrap_or_else(|| "127.0.0.1:8787".to_string());
+        let bind = get("YMUX_SERVER_BIND").unwrap_or_else(|| "127.0.0.1:11020".to_string());
         let bind: SocketAddr = bind
             .trim()
             .parse()
@@ -139,14 +139,14 @@ mod tests {
         let c = cfg(&[("YMUX_SERVER_PUBLIC_URL", "https://Example.com/")]).unwrap();
         assert_eq!(c.origin, "https://example.com");
         assert!(c.https);
-        assert_eq!(c.bind.to_string(), "127.0.0.1:8787");
+        assert_eq!(c.bind.to_string(), "127.0.0.1:11020");
         assert!(!c.trust_proxy);
     }
 
     #[test]
     fn http_only_for_loopback_dev() {
-        let c = cfg(&[("YMUX_SERVER_PUBLIC_URL", "http://localhost:8787")]).unwrap();
-        assert_eq!(c.origin, "http://localhost:8787");
+        let c = cfg(&[("YMUX_SERVER_PUBLIC_URL", "http://localhost:11020")]).unwrap();
+        assert_eq!(c.origin, "http://localhost:11020");
         assert!(!c.https);
         assert!(cfg(&[("YMUX_SERVER_PUBLIC_URL", "http://127.0.0.1:9")]).is_ok());
         assert!(cfg(&[("YMUX_SERVER_PUBLIC_URL", "http://192.168.1.2")]).is_err());
