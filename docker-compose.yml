@@ -1,0 +1,35 @@
+# yMux server behind Caddy, which obtains and renews the TLS certificate.
+#
+#   1. Point a DNS name at this machine and set it below (and in Caddyfile).
+#   2. docker compose up -d
+#   3. docker compose exec ymux-server ymux-server token   (shows the setup token; it is never
+#      written to the logs, which only say that one was created)
+services:
+  ymux-server:
+    build: .
+    restart: unless-stopped
+    environment:
+      YMUX_SERVER_PUBLIC_URL: https://remote.example.com
+      YMUX_SERVER_TRUST_PROXY: "1"
+    volumes:
+      - ymux-data:/data
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - ymux-server
+
+volumes:
+  ymux-data:
+  caddy-data:
+  caddy-config:

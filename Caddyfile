@@ -1,0 +1,4 @@
+remote.example.com {
+	# Caddy proxies WebSocket upgrades automatically.
+	reverse_proxy ymux-server:8787
+}
