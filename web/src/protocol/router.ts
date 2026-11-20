@@ -29,7 +29,7 @@ export const DELIVERED_UNKNOWN = "delivered_unknown";
 export const NOT_DELIVERED = "not_delivered";
 export const COULD_NOT_CONFIRM = "could_not_confirm";
 
-const isRead = (cmd: Cmd): boolean => cmd.op === "list" || cmd.op === "peek";
+const isRead = (cmd: Cmd): boolean => cmd.op === "list" || cmd.op === "peek" || cmd.op === "chat";
 
 export interface RouterDeps {
   send: (frame: string) => void;

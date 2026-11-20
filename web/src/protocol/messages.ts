@@ -1,6 +1,6 @@
 // Message builders and defensive parsers (PROTOCOL.md sections 3-6).
 // Parsers never throw: anything of the wrong shape yields null / is dropped.
-import { cleanText } from "./clean";
+import { cleanBlock, cleanText } from "./clean";
 import { isUuid } from "./encoding";
 
 export const PROTOCOL_VERSION = 1;
@@ -47,9 +47,29 @@ export interface Peek {
   status: PaneStatus;
 }
 
+export type ChatRole = "user" | "assistant" | "tool";
+export interface ChatItem {
+  id: string;
+  role: ChatRole;
+  text: string;
+  /** Epoch ms; 0 when unknown. */
+  ts: number;
+}
+/** One `chat` reply. `conv === ""` is the empty form (no conversation to show). */
+export interface ChatPage {
+  conv: string;
+  agent: "claude" | "codex" | "";
+  items: ChatItem[];
+  start: number;
+  end: number;
+  older: boolean;
+  newer: boolean;
+}
+
 export type Cmd =
   | { op: "list" }
   | { op: "peek"; pane: string; lines: number }
+  | { op: "chat"; pane: string; conv?: string; after?: number; before?: number }
   | { op: "answer"; pane: string; n: number; label: string; menu_id: string }
   | { op: "interrupt"; pane: string }
   | { op: "prompt"; pane: string; text: string; queue: boolean };
@@ -219,6 +239,57 @@ export function parsePeekData(data: unknown): Peek | null {
   };
 }
 
+const CONV_RE = /^[A-Za-z0-9_-]{1,32}$/;
+const ITEM_ID_RE = /^[0-9.]{1,40}$/;
+export const MAX_CHAT_ITEMS = 40;
+export const MAX_CHAT_TEXT = 8000;
+export const MAX_TOOL_TEXT = 200;
+const ROLES: readonly string[] = ["user", "assistant", "tool"];
+const EMPTY_PAGE: ChatPage = { conv: "", agent: "", items: [], start: 0, end: 0, older: false, newer: false };
+
+const isPos = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+function parseChatItem(v: unknown): ChatItem | null {
+  const r = asRec(v);
+  if (!r || typeof r.id !== "string" || !ITEM_ID_RE.test(r.id)) return null;
+  if (typeof r.role !== "string" || !ROLES.includes(r.role) || typeof r.text !== "string") return null;
+  const role = r.role as ChatRole;
+  const text =
+    role === "tool"
+      ? cleanText(r.text.slice(0, MAX_TOOL_TEXT * 4)).slice(0, MAX_TOOL_TEXT)
+      : cleanBlock(r.text.slice(0, MAX_CHAT_TEXT * 2)).slice(0, MAX_CHAT_TEXT);
+  const ts = typeof r.ts_ms === "number" && Number.isSafeInteger(r.ts_ms) && r.ts_ms > 0 ? r.ts_ms : 0;
+  return { id: r.id, role, text, ts };
+}
+
+/** A `chat` reply (PROTOCOL.md 5.2); null when it is malformed. Never throws. */
+export function parseChatData(data: unknown): ChatPage | null {
+  const r = asRec(data);
+  if (!r || typeof r.conv !== "string") return null;
+  if (r.conv === "") return { ...EMPTY_PAGE };
+  if (!CONV_RE.test(r.conv)) return null;
+  if (!Array.isArray(r.items) || r.items.length > MAX_CHAT_ITEMS) return null;
+  if (!isPos(r.start) || !isPos(r.end) || r.start > r.end) return null;
+  const items: ChatItem[] = [];
+  const seen = new Set<string>();
+  for (const x of r.items) {
+    const it = parseChatItem(x);
+    if (it && !seen.has(it.id)) {
+      seen.add(it.id);
+      items.push(it);
+    }
+  }
+  return {
+    conv: r.conv,
+    agent: r.agent === "claude" || r.agent === "codex" ? r.agent : "",
+    items,
+    start: r.start,
+    end: r.end,
+    older: r.older === true,
+    newer: r.newer === true,
+  };
+}
+
 /** `data.result` when it is one of the allowed words, else null. */
 export function parseResultData(data: unknown, allowed: readonly string[]): string | null {
   const r = asRec(data);
@@ -294,6 +365,16 @@ export function validateCmd(cmd: Cmd): string | null {
       return isUuid(cmd.pane) && Number.isInteger(cmd.lines) && cmd.lines >= 1 && cmd.lines <= 200
         ? null
         : "bad_request";
+    case "chat": {
+      if (!isUuid(cmd.pane)) return "bad_request";
+      const hasAfter = cmd.after !== undefined;
+      const hasBefore = cmd.before !== undefined;
+      if (cmd.conv === undefined) return hasAfter || hasBefore ? "bad_request" : null;
+      if (!CONV_RE.test(cmd.conv) || (hasAfter && hasBefore)) return "bad_request";
+      if (hasAfter && !isPos(cmd.after)) return "bad_request";
+      if (hasBefore && !isPos(cmd.before)) return "bad_request";
+      return null;
+    }
     case "answer":
       return isUuid(cmd.pane) &&
         Number.isInteger(cmd.n) &&

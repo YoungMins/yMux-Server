@@ -19,10 +19,12 @@ import { b64uEncode, newUuid } from "../src/protocol/encoding";
 import {
   cmdFrame,
   parseBody,
+  parseChatData,
   parseListData,
   parsePeekData,
   parseResultData,
   parseServerFrame,
+  type ChatPage,
   type ReplyResult,
 } from "../src/protocol/messages";
 import { aadD2P, aadP2D, deriveLinkKey, generateAgreementKey, open, seal } from "../src/protocol/seal";
@@ -377,6 +379,48 @@ describe("device against a real server and a real desktop", () => {
     expect(parseResultData(ok(await prompt("go on", false)), ["sent", "queued"])).toBe("sent");
     expect(parseResultData(ok(await prompt("!rm -rf /", false)), ["refused", "sent"]), "a leading ! is refused").toBe("refused");
     expect(parseResultData(ok(await prompt("later, please", true)), ["sent", "queued"])).toBe("queued");
+  });
+
+  it("reads the conversation with chat: the newest page, then nothing after its end", async () => {
+    const ask = async (pane: string, extra: { conv?: string; after?: number; before?: number } = {}) => {
+      const r = await remote.request({ op: "chat", pane, ...extra });
+      return { code: r.ok ? "" : r.code, page: r.ok ? parseChatData(r.data) : null };
+    };
+    // The fake desktop serves a synthetic conversation on one of its panes; do not assume which.
+    let pane = "";
+    let first: ChatPage | null = null;
+    let code = "";
+    for (const p of [P1, P2]) {
+      const r = await ask(p);
+      code = r.code || code;
+      if (r.page && r.page.conv !== "") {
+        pane = p;
+        first = r.page;
+        break;
+      }
+    }
+    expect(first, `a pane answers chat with a conversation (error codes seen: "${code}"; unknown_op means the desktop lacks chat)`).not.toBeNull();
+    const page = first!;
+    expect(page.conv).toMatch(/^[A-Za-z0-9_-]{1,32}$/);
+    expect(["claude", "codex"]).toContain(page.agent);
+    expect(page.items.length, "the newest page has items").toBeGreaterThan(0);
+    expect(page.items.length).toBeLessThanOrEqual(40);
+    expect(page.start).toBeLessThanOrEqual(page.end);
+    expect(new Set(page.items.map((i) => i.id)).size, "ids are unique").toBe(page.items.length);
+    for (const i of page.items) {
+      expect(["user", "assistant", "tool"]).toContain(i.role);
+      expect(i.id).toMatch(/^[0-9.]{1,40}$/);
+      if (i.role === "tool") expect(i.text.includes("\n"), "a tool text is one line").toBe(false);
+    }
+    const texts = page.items.filter((i) => i.role !== "tool").map((i) => i.text);
+    expect(texts.some((x) => x.includes("|") && /\n\s*\|?\s*:?-{2,}/.test(x)), "a Markdown pipe table arrives with its newlines").toBe(true);
+    expect(texts.some((x) => /[가-힣]/u.test(x)), "Hangul text survives").toBe(true);
+
+    const next = await ask(pane, { conv: page.conv, after: page.end });
+    expect(next.page, `after: end is answered (${next.code})`).not.toBeNull();
+    expect(next.page!.conv).toBe(page.conv);
+    expect(next.page!.items, "nothing is new after the end").toEqual([]);
+    expect(next.page!.newer).toBe(false);
   });
 
   it("reports a write the page was still typing after 5 s as delivered, result unknown, and never re-sends it", async () => {

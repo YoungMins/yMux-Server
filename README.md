@@ -212,6 +212,14 @@ other way (in a message, on a web page) must not be opened. The device name show
 pairing dialog is chosen by the phone and is not verified; type only the number shown on the yMux
 pairing page on your own phone, never a number from the yMux window, a notification or a message.
 
+### Reading the conversation
+
+The detail screen of an agent shows its conversation (Claude Code, Codex) as chat bubbles with
+rendered Markdown (tables, lists and code scroll or wrap to fit the phone), with a **Screen**
+toggle in the header for the raw terminal text. It needs a yMux that knows the `chat` op
+(PROTOCOL.md 5.2); an older yMux simply keeps showing the screen. The desktop reads the agent's own
+transcript, and conversation sharing can be turned off in yMux's settings.
+
 ### Several computers
 
 To follow more than one computer from one phone, connect each yMux to the same server with the

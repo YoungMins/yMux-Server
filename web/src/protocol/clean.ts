@@ -23,6 +23,14 @@ export function cleanDeviceName(s: string): string {
   return out === "" ? UNNAMED_DEVICE : out;
 }
 
+/**
+ * Multi-line message text (PROTOCOL.md 5.2, `chat` user/assistant texts): CR and CRLF become LF,
+ * LF and tab stay, every other Cc/Cf/Zl/Zp character goes.
+ */
+export function cleanBlock(s: string): string {
+  return s.replace(/\r\n?/g, "\n").replace(STRIP, (m) => (m === "\n" || m === "\t" ? m : ""));
+}
+
 /** `keepNewline` is for values that are multi-line by design; every other control goes. */
 export function cleanText(s: string, keepNewline = false): string {
   return s.replace(STRIP, (m) => (keepNewline && m === "\n" ? m : ""));

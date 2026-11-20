@@ -1,5 +1,19 @@
 import { currentLang, t } from "../i18n";
 import { composerAccess, composerMode, growLayout, promptConsumed, reportTarget, shouldQueue } from "../model/chat";
+import {
+  applyPage,
+  groupRows,
+  itemCount,
+  jumpLatest,
+  items as convItems,
+  markUnsupported,
+  newConversation,
+  noteFailure,
+  nextRequest,
+  olderRequest,
+  type ChatRequest,
+} from "../model/conversation";
+import { afterOlderReply, decide, idle, sent, tap, throttleMs, type Sched } from "../model/chatSchedule";
 import { desktopName } from "../model/desktops";
 import { menuChoices, type Choice } from "../model/menu";
 import { formatSince } from "../model/panes";
@@ -7,11 +21,13 @@ import { paneKey, type PaneRef } from "../model/route";
 import { isOnline } from "../net/remote";
 import {
   capAllows,
+  parseChatData,
   parsePeekData,
   parseResultData,
   startsWithBang,
   type Pane,
   type PaneStatus,
+  type ChatItem,
   type Peek,
   type ReplyResult,
 } from "../protocol/messages";
@@ -19,7 +35,19 @@ import { COULD_NOT_CONFIRM, DELIVERED_UNKNOWN, NOT_DELIVERED } from "../protocol
 import { computerName, connectionNotice, errorText, resultText, statusText } from "./common";
 import { h, setChildren } from "./dom";
 import { icon } from "./icons";
+import { renderMarkdown } from "./markdownDom";
 import type { Ctx, View } from "./view";
+
+type Pref = "conversation" | "screen";
+/** Desktops that answered `unknown_op` to `chat`: not asked again while this page lives. */
+const noChat = new Set<string>();
+/** The Conversation / Screen choice per pane, for the page session. */
+const viewPref = new Map<string, Pref>();
+/** After a prompt is sent, ask for the conversation again at these delays (ms). */
+const KICK_MS = [0, 900, 2200];
+const MAX_CATCH_UP = 12;
+/** The server allows 5 chat commands per second per device; a view stays under that. */
+const MAX_CHAT_PER_SEC = 4;
 
 const POLL_MS = 2000;
 const PEEK_LINES = 80;
@@ -56,7 +84,40 @@ export function detailView(ctx: Ctx, ref: PaneRef): View {
   const notice = h("p", { class: "notice", role: "status" });
   const gone = h("p", { class: "notice" }, t("detail.gone"));
   const screen = h("pre", { class: "screen", tabindex: "0", "aria-label": t("detail.screen") });
-  const scroll = h("div", { class: "scroll conv__scroll" }, notice, gone, screen);
+  const hint = h("p", { class: "notice" }, t("detail.convUnavailable"));
+  const loadingLine = h("p", { class: "chat__empty" }, t("detail.convLoading"));
+  const noneLine = h("p", { class: "chat__empty" }, t("detail.convNone"));
+  const olderBtn = h("button", { class: "chat__older", type: "button", onclick: () => loadOlder() }, t("detail.loadOlder"));
+  const msgs = h("div", { class: "chat__list" });
+  const workingRow = h(
+    "div",
+    { class: "msg msg--assistant msg--working", role: "status" },
+    h("span", { class: "dots", "aria-hidden": "true" }, h("i"), h("i"), h("i")),
+    h("span", { class: "muted" }, t("detail.working")),
+  );
+  const jumpBtn = h("button", { class: "chat__older", type: "button", onclick: () => jumpToLatest() }, t("detail.jumpLatest"));
+  const chat = h("div", { class: "chat" }, olderBtn, msgs, noneLine, workingRow, jumpBtn);
+  const scroll = h("div", { class: "scroll conv__scroll" }, notice, gone, hint, loadingLine, screen, chat);
+
+  const btnConv = h("button", { class: "seg__btn", type: "button", onclick: () => setPref("conversation") }, t("detail.conversation"));
+  const btnScreen = h("button", { class: "seg__btn", type: "button", onclick: () => setPref("screen") }, t("detail.screen"));
+  const toggle = h("div", { class: "seg", role: "group", "aria-label": t("detail.viewSwitch") }, btnConv, btnScreen);
+
+  let conv = newConversation(noChat.has(ref.desktopId));
+  let inflightN = 0;
+  let chatErrors = 0;
+  let catchUp = 0;
+  let loadingOlder = false;
+  let anchor: { height: number; top: number } | null = null;
+  let paintedRev = -1;
+  const kickTimers = new Set<ReturnType<typeof setTimeout>>();
+  let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+  let wakePoll = false;
+  let sched: Sched = idle;
+  let shownConv = "";
+  const sentAt: number[] = [];
+  const openTools = new Set<string>();
+  const cache = new Map<string, { text: string; el: HTMLElement }>();
 
   const questionBox = h("div", { class: "qcard" });
   const bubble = h("div", { class: "bubble", role: "status", "aria-live": "polite" });
@@ -82,6 +143,7 @@ export function detailView(ctx: Ctx, ref: PaneRef): View {
       { class: "topbar" },
       h("a", { class: "iconbtn back", href: "#", "aria-label": t("nav.back") }, icon("back")),
       h("div", { class: "topbar__titles" }, title, sub),
+      toggle,
     ),
     scroll,
     foot,
@@ -170,6 +232,206 @@ export function detailView(ctx: Ctx, ref: PaneRef): View {
     questionBox.hidden = q.length === 0 && choices.length === 0;
   };
 
+  const pref = (): Pref => viewPref.get(key) ?? "conversation";
+  const wantsChat = (): boolean => pref() === "conversation" && !conv.unsupported;
+  /** What fills the scroll area: the conversation, the terminal text, or a wait for the first reply. */
+  const bodyMode = (): "chat" | "screen" | "loading" => {
+    if (!wantsChat()) return "screen";
+    if (conv.loaded) return conv.conv !== "" ? "chat" : "screen";
+    return chatErrors >= 2 ? "screen" : "loading";
+  };
+
+  const messageEl = (it: ChatItem): HTMLElement => {
+    const hit = cache.get(it.id);
+    if (hit && hit.text === it.text) return hit.el;
+    const el = h("div", { class: `msg msg--${it.role}` }, renderMarkdown(it.text));
+    cache.set(it.id, { text: it.text, el });
+    return el;
+  };
+  const toolEl = (list: ChatItem[]): HTMLElement => {
+    if (list.length === 1) return h("div", { class: "msg-tool" }, list[0]!.text);
+    const first = list[0]!.id;
+    const d = h(
+      "details",
+      {
+        class: "msg-tools",
+        open: openTools.has(first),
+        ontoggle: () => {
+          if (d.open) openTools.add(first);
+          else openTools.delete(first);
+        },
+      },
+      h("summary", null, t("detail.toolCalls", { n: list.length })),
+      ...list.map((it) => h("div", { class: "msg-tool" }, it.text)),
+    );
+    return d;
+  };
+
+  const paintChat = (): void => {
+    if (paintedRev !== conv.rev) {
+      paintedRev = conv.rev;
+      const list = convItems(conv);
+      const live = new Set(list.map((i) => i.id));
+      if (shownConv !== conv.conv) {
+        shownConv = conv.conv;
+        cache.clear();
+        openTools.clear();
+      }
+      for (const id of cache.keys()) if (!live.has(id)) cache.delete(id);
+      for (const id of openTools) if (!live.has(id)) openTools.delete(id);
+      msgs.replaceChildren(...groupRows(list).map((r) => (r.kind === "msg" ? messageEl(r.item) : toolEl(r.items))));
+      if (anchor) scroll.scrollTop = anchor.top + (scroll.scrollHeight - anchor.height);
+    }
+    olderBtn.hidden = !conv.older;
+    olderBtn.disabled = loadingOlder;
+    jumpBtn.hidden = !conv.browsing;
+    noneLine.hidden = itemCount(conv) > 0 || status() === "working";
+    workingRow.hidden = status() !== "working" || conv.browsing;
+  };
+
+  const paintBody = (): void => {
+    const mode = bodyMode();
+    screen.hidden = mode !== "screen";
+    chat.hidden = mode !== "chat";
+    loadingLine.hidden = mode !== "loading";
+    hint.hidden = !(pref() === "conversation" && conv.loaded && conv.conv === "" && !conv.unsupported);
+    const canToggle = !conv.unsupported && !(conv.loaded && conv.conv === "");
+    toggle.hidden = !canToggle;
+    for (const [b, p] of [
+      [btnConv, "conversation"],
+      [btnScreen, "screen"],
+    ] as const) {
+      b.setAttribute("aria-pressed", String(pref() === p));
+      b.classList.toggle("is-on", pref() === p);
+    }
+    if (mode === "chat") paintChat();
+    else {
+      const text = peek ? peek.lines.join("\n") : "";
+      if (peek && text === "") screen.textContent = t("detail.empty");
+      else if (screen.textContent !== text) screen.textContent = text;
+    }
+    if (stick && mode !== "loading") scroll.scrollTop = scroll.scrollHeight;
+  };
+
+  const setPref = (p: Pref): void => {
+    viewPref.set(key, p);
+    stick = true;
+    paint();
+    void pollChat();
+  };
+
+  /** Asks the desktop for `req`; the reply is folded into `conv`. */
+  async function sendChat(req: ChatRequest, older: boolean): Promise<void> {
+    if (!remote) return;
+    sentAt.push(performance.now());
+    inflightN++;
+    let ok = false;
+    try {
+      const r = await remote.request({ op: "chat", pane: paneId, ...req });
+      if (destroyed) return;
+      if (r.ok) {
+        const page = parseChatData(r.data);
+        if (page) {
+          conv = applyPage(conv, req, page, Date.now());
+          chatErrors = 0;
+          ok = true;
+        } else {
+          chatErrors++;
+          conv = noteFailure(conv, req);
+        }
+      } else if (r.code === "unknown_op") {
+        noChat.add(ref.desktopId);
+        conv = markUnsupported(conv);
+      } else {
+        chatErrors++;
+        conv = noteFailure(conv, req);
+      }
+    } finally {
+      inflightN--;
+    }
+    paint(); // uses `anchor`, so the chain's state is settled after it
+    if (older && sched.active) {
+      sched = ok ? afterOlderReply(sched, conv) : idle;
+      if (!sched.active) {
+        endOlder();
+        paint();
+      }
+    }
+    // a long conversation comes in pages: fetch the next one at once
+    const more = conv.newer && !conv.browsing && wantsChat() && catchUp < MAX_CATCH_UP;
+    catchUp = more ? catchUp + 1 : 0;
+    pump(more);
+  }
+
+  /** The one place that decides what goes out next (model/chatSchedule.ts); it runs whenever something settles. */
+  function pump(pollWanted: boolean): void {
+    if (destroyed) return;
+    if (document.hidden || !wantsChat() || !remote || !ready() || !pane()) {
+      if (sched.active) {
+        endOlder();
+        paint();
+      }
+      return;
+    }
+    const pollReq = pollWanted ? nextRequest(conv, Date.now()) : null;
+    const d = decide(sched, {
+      inflight: inflightN > 0,
+      throttleMs: throttleMs(sentAt, performance.now(), MAX_CHAT_PER_SEC),
+      pollWanted: pollReq !== null,
+    });
+    if (d.do === "wait") {
+      wakePoll ||= pollWanted;
+      if (!wakeTimer) {
+        wakeTimer = setTimeout(() => {
+          wakeTimer = null;
+          const p = wakePoll;
+          wakePoll = false;
+          pump(p);
+        }, d.ms);
+      }
+    } else if (d.do === "older") {
+      const req = olderRequest(conv);
+      if (!req) {
+        endOlder();
+        paint();
+        return;
+      }
+      anchor ??= { height: scroll.scrollHeight, top: scroll.scrollTop };
+      sched = sent(sched);
+      void sendChat(req, true);
+    } else if (d.do === "poll" && pollReq) {
+      void sendChat(pollReq, false);
+    }
+  }
+
+  const pollChat = (): void => pump(true);
+
+  /** The older chain is over, whichever way: nothing pending, button free, scroll anchor dropped. */
+  function endOlder(): void {
+    sched = idle;
+    loadingOlder = false;
+    anchor = null;
+  }
+
+  function loadOlder(): void {
+    if (sched.active || !olderRequest(conv)) return;
+    stick = false;
+    sched = tap(sched);
+    loadingOlder = true;
+    paintChat();
+    pump(false);
+  }
+
+  function jumpToLatest(): void {
+    endOlder();
+    conv = jumpLatest(conv);
+    stick = true;
+    paint();
+    // at once, even with an older request in flight: its late reply is ignored (conv.resync)
+    if (remote && ready() && pane() && wantsChat() && !document.hidden) void sendChat({}, false);
+    else pollChat();
+  }
+
   const paint = (): void => {
     const p = pane();
     title.textContent = p?.title || t("list.untitled");
@@ -186,10 +448,7 @@ export function detailView(ctx: Ctx, ref: PaneRef): View {
     notice.hidden = !n;
     gone.hidden = !(remote?.state.panes && !p);
 
-    const text = peek ? peek.lines.join("\n") : "";
-    if (peek && text === "") screen.textContent = t("detail.empty");
-    else if (screen.textContent !== text) screen.textContent = text;
-    if (stick) scroll.scrollTop = scroll.scrollHeight;
+    paintBody();
 
     const access = composerAccess(cap());
     form.hidden = !(access === "full" || access === null);
@@ -201,6 +460,11 @@ export function detailView(ctx: Ctx, ref: PaneRef): View {
   };
 
   async function pollNow(): Promise<void> {
+    void pollChat();
+    await pollPeek();
+  }
+
+  async function pollPeek(): Promise<void> {
     if (destroyed || inflight || document.hidden || !remote || !ready() || !pane()) return;
     inflight = true;
     try {
@@ -306,8 +570,20 @@ export function detailView(ctx: Ctx, ref: PaneRef): View {
         grow();
       }
       return resultText(r, result);
-    }, true);
+    }, true).then(kickChat);
   };
+
+  /** The sent prompt shows up in the transcript a moment later: ask a few times, soon. */
+  function kickChat(): void {
+    if (destroyed) return;
+    for (const ms of KICK_MS) {
+      const tm = setTimeout(() => {
+        kickTimers.delete(tm);
+        void pollChat();
+      }, ms);
+      kickTimers.add(tm);
+    }
+  }
 
   const stop = (): void => {
     if (!remote) return;
@@ -373,7 +649,11 @@ export function detailView(ctx: Ctx, ref: PaneRef): View {
       unsub();
       clearInterval(poll);
       clearInterval(sinceTimer);
-      for (const tm of [confirmTimer, bubbleTimer, fadeTimer]) if (tm) clearTimeout(tm);
+      for (const tm of [confirmTimer, bubbleTimer, fadeTimer, wakeTimer, ...kickTimers]) if (tm) clearTimeout(tm);
+      kickTimers.clear();
+      wakeTimer = null;
+      openTools.clear();
+      cache.clear();
       document.removeEventListener("visibilitychange", onVisible);
     },
   };
